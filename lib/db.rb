@@ -1,5 +1,6 @@
 require 'json'
 require 'set'
+require 'zlib'
 
 class FileStore
 
@@ -50,12 +51,13 @@ class FileStore
 
   def write_kv(f, key, value)
     ksize = key.bytesize
-    vsize = value.bytesize
+    v_deflated = Zlib.deflate(value)
+    vsize = v_deflated.bytesize # TODO: compression
     bytes_written = 0
     bytes_written += f.write(encode_int(ksize))
-    bytes_written += f.write(key) # TODO: compression
+    bytes_written += f.write(key)
     bytes_written += f.write(encode_int(vsize))
-    bytes_written + f.write(value) # TODO: compression
+    bytes_written + f.write(v_deflated)
   end
 
   def dump_sst!
@@ -132,7 +134,7 @@ class FileStore
           value_size = decode_int(data.byteslice(offset...offset += 4))
           value = data.byteslice(offset...offset += value_size)
           if k == key
-            return value
+            return Zlib.inflate(value)
           elsif k > key
             break
           end
