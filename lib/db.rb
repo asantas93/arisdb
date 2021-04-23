@@ -74,10 +74,12 @@ class FileStore
       @write_sst = SortedSet.new
       s
     end
-    f_name = new_sst_path
-    @index[File.basename(f_name)] = {}
-    File.open(f_name, 'w') do |f|
-      write_records(sst, f)
+    if sst.any?
+      f_name = new_sst_path
+      @index[File.basename(f_name)] = {}
+      File.open(f_name, 'w') do |f|
+        write_records(sst, f)
+      end
     end
     @read_sst = @write_sst
   end
@@ -160,8 +162,10 @@ class FileStore
     path = new_sst_path
     # TODO: don't always merge all SSTs?
     to_merge = Dir.glob(File.join(@root, 'sst', '*'))
-    File.open(path, 'w') do |new|
-      merge_ssts!(to_merge, new)
+    if to_merge.size > 1
+      File.open(path, 'w') do |new|
+        merge_ssts!(to_merge, new)
+      end
     end
   end
 
@@ -203,12 +207,9 @@ class FileStore
         yielder << Record.new(min.key, min.value)
         dups = current.select { |rec| rec.key == min.key }
         dups.each do |rec|
-          k_next, v_next = read_kv(rec.file)
-          if k_next.nil?
+          rec.key, rec.value = read_kv(rec.file)
+          if rec.key.nil?
             current.delete(rec)
-          else
-            rec.key = k_next
-            rec.value = v_next
           end
         end
       end
