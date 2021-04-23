@@ -52,12 +52,20 @@ class FileStore
   def write_kv(f, key, value)
     ksize = key.bytesize
     v_deflated = Zlib.deflate(value)
-    vsize = v_deflated.bytesize # TODO: compression
+    vsize = v_deflated.bytesize
     bytes_written = 0
     bytes_written += f.write(encode_int(ksize))
     bytes_written += f.write(key)
     bytes_written += f.write(encode_int(vsize))
     bytes_written + f.write(v_deflated)
+  end
+
+  def sst_path(name)
+    File.join(@root, 'sst', name)
+  end
+
+  def new_sst_path
+    sst_path((Time.now.to_r * 10 ** 9).to_i.to_s)
   end
 
   def dump_sst!
@@ -66,22 +74,26 @@ class FileStore
       @write_sst = SortedSet.new
       s
     end
-    f_name = File.join(@root, 'sst', Time.now.to_i.to_s)
-    @index[f_name] = {}
+    f_name = new_sst_path
+    @index[File.basename(f_name)] = {}
     File.open(f_name, 'w') do |f|
-      last_index_offset = -@sparse_factor
-      offset = 0
-      sst.each do |record|
-        if offset >= last_index_offset + @sparse_factor
-          @mutex.synchronize do
-            @index[f_name][record.key] = offset
-          end
-          last_index_offset = offset
-        end
-        offset += write_kv(f, record.key, record.value)
-      end
+      write_records(sst, f)
     end
     @read_sst = @write_sst
+  end
+
+  def write_records(records, f)
+    last_index_offset = -@sparse_factor
+    offset = 0
+    records.each do |record|
+      if offset >= last_index_offset + @sparse_factor
+        @mutex.synchronize do
+          @index[File.basename(f.path)][record.key] = offset
+        end
+        last_index_offset = offset
+      end
+      offset += write_kv(f, record.key, record.value)
+    end
   end
 
   def put(key, value)
@@ -118,7 +130,7 @@ class FileStore
       ranges.reverse_each do |fname, range|
         lower, upper = range
         start = lower[1]
-        data = File.open(fname) do |f|
+        data = File.open(sst_path(fname)) do |f|
           f.seek(start)
           if upper.nil?
             f.read
@@ -141,6 +153,80 @@ class FileStore
         end
       end
       nil
+    end
+  end
+
+  def compact!
+    path = new_sst_path
+    # TODO: don't always merge all SSTs?
+    to_merge = Dir.glob(File.join(@root, 'sst', '*'))
+    File.open(path, 'w') do |new|
+      merge_ssts!(to_merge, new)
+    end
+  end
+
+  def merge_ssts!(unopened, new, opened: [])
+    if unopened.any?
+      to_open = unopened.pop
+      File.open(to_open) do |f|
+        opened << f
+        merge_ssts!(unopened, new, opened: opened)
+        @mutex.synchronize { @index.delete(File.basename(f.path)) }
+      end
+      File.delete(to_open)
+    else
+      File.open(new, 'w') do |f|
+        _merge_ssts!(opened, f)
+      end
+    end
+  end
+
+  MergeRecord = Struct.new(:key, :value, :file) do
+    def <=>(other)
+      k_comp = key <=> other.key
+      if k_comp == 0
+        file.path <=> other.file.path
+      else
+        k_comp
+      end
+    end
+  end
+
+  def _merge_ssts!(files, new)
+    current = files.map do |f|
+      k, v = read_kv(f)
+      MergeRecord.new(k, v, f)
+    end
+    to_write = Enumerator.new do |yielder|
+      while current.any? do
+        min = current.min
+        yielder << Record.new(min.key, min.value)
+        dups = current.select { |rec| rec.key == min.key }
+        dups.each do |rec|
+          k_next, v_next = read_kv(rec.file)
+          if k_next.nil?
+            current.delete(rec)
+          else
+            rec.key = k_next
+            rec.value = v_next
+          end
+        end
+      end
+    end
+    @index[File.basename(new.path)] = {}
+    write_records(to_write, new)
+  end
+
+  def read_kv(f)
+    key_size_bytes = f.read(4)
+    if key_size_bytes.nil?
+      nil
+    else
+      key_size = decode_int(key_size_bytes)
+      key = f.read(key_size)
+      value_size = decode_int(f.read(4))
+      value = Zlib.inflate(f.read(value_size))
+      [key, value]
     end
   end
 
