@@ -185,7 +185,7 @@ class FileStore
     def <=>(other)
       k_comp = key <=> other.key
       if k_comp == 0
-        file.path <=> other.file.path
+        other.file.path <=> file.path
       else
         k_comp
       end
