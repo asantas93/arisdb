@@ -85,12 +85,13 @@ class FileStore
   end
 
   def write_records(records, f)
+    file_index = @index[File.basename(f.path)]
     last_index_offset = -@sparse_factor
     offset = 0
     records.each do |record|
       if offset >= last_index_offset + @sparse_factor
         @mutex.synchronize do
-          @index[File.basename(f.path)][record.key] = offset
+          file_index[record.key] = offset
         end
         last_index_offset = offset
       end
