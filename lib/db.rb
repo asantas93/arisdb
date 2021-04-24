@@ -2,7 +2,13 @@ require 'json'
 require 'set'
 require 'zlib'
 
+def nano_s
+  (Time.now.to_r * 10 ** 9).to_i.to_s
+end
+
 class FileStore
+
+  attr_accessor :inactive_log, :active_log
 
   MAX_VALUE_SIZE = 2 ** 32 - 1
 
@@ -16,14 +22,15 @@ class FileStore
     end
   end
 
-  def initialize(root, index:, unwritten_log:, sparse_factor: nil)
+  def initialize(root, index:, active_log:, sparse_factor: nil)
     @root = root
     @sparse_factor = sparse_factor || 4096
     @index = index
     @write_sst = SortedSet.new
     @read_sst = @write_sst
     @mutex = Mutex.new
-    @unwritten_log = unwritten_log
+    @active_log = active_log
+    @inactive_log = nil
   end
 
   def self.open(root, sparse_factor: nil)
@@ -33,12 +40,26 @@ class FileStore
     else
       Dir.mkdir(root)
       Dir.mkdir(File.join(root, 'sst'))
+      Dir.mkdir(File.join(root, 'unwritten'))
       index = {}
     end
     begin
-      File.open(File.join(root, 'unwritten.log'), 'a') do |unwritten_log|
-        store = FileStore.new(root, index: index, unwritten_log: unwritten_log, sparse_factor: sparse_factor)
+      old_logs = Dir.glob(File.join(root, 'unwritten', '*'))
+      active_log = File.open(File.join(root, 'unwritten', nano_s), 'w')
+      store = FileStore.new(root, index: index, active_log: active_log, sparse_factor: sparse_factor)
+      begin
+        old_logs.sort.each do |log|
+          File.open(log) do |f|
+            while (k, v = store.read_kv(f))
+              store.put(k, v)
+            end
+          end
+          File.delete(log)
+        end
         yield store
+      ensure
+        store.active_log.close
+        store.inactive_log&.close unless store.inactive_log&.closed?
       end
     ensure
       File.write(index_path, JSON.dump(index))
@@ -51,6 +72,7 @@ class FileStore
 
   def write_kv(f, key, value)
     ksize = key.bytesize
+    # TODO: compress entire file, using Zlib::FULL_FLUSH at index points
     v_deflated = Zlib.deflate(value)
     vsize = v_deflated.bytesize
     bytes_written = 0
@@ -65,13 +87,16 @@ class FileStore
   end
 
   def new_sst_path
-    sst_path((Time.now.to_r * 10 ** 9).to_i.to_s)
+    sst_path(nano_s)
   end
 
   def dump_sst!
     sst = @mutex.synchronize do
       s = @write_sst
       @write_sst = SortedSet.new
+      @active_log.close
+      @inactive_log = @active_log
+      @active_log = File.open(File.join(@root, 'unwritten', nano_s), 'w')
       s
     end
     if sst.any?
@@ -80,6 +105,7 @@ class FileStore
       File.open(f_name, 'w') do |f|
         write_records(sst, f)
       end
+      File.delete(@inactive_log.path)
     end
     @read_sst = @write_sst
   end
@@ -103,9 +129,9 @@ class FileStore
     if value.bytesize > MAX_VALUE_SIZE
       raise "Value is too large to store under a single key"
     end
-    write_kv(@unwritten_log, key, value)
     r = Record.new(key, value)
     @mutex.synchronize do
+      write_kv(@active_log, key, value)
       if @write_sst.include?(r)
         @write_sst.delete(r)
       end
