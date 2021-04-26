@@ -13,7 +13,8 @@ Dir.mktmpdir do |tmp|
     puts store.get('orange')
     puts store.get('banana')
     puts store.get('notakey')
-    store.dump_sst!
+    store.initiate_dump!
+    store.wait!
     puts store.get('apple')
     puts store.get('orange')
     puts store.get('banana')

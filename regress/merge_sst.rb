@@ -9,11 +9,13 @@ Dir.mktmpdir do |tmp|
     store.put('apple', 'a red-skinned fruit that tastes okay')
     store.put('orange', "it's orange")
     store.put('banana', 'yellow')
-    store.dump_sst!
+    store.initiate_dump!
+    store.wait!
     store.put('orange', 'new vision for oranges')
     store.put('xylophone', '????')
     store.put('ack', 'ACK ATTACK')
-    store.dump_sst!
+    store.initiate_dump!
+    store.wait!
     puts store.get('apple')
     puts store.get('orange')
     puts store.get('banana')

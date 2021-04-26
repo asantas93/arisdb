@@ -8,7 +8,7 @@ end
 
 class FileStore
 
-  attr_accessor :inactive_log, :active_log
+  attr_accessor :active_log
 
   MAX_VALUE_SIZE = 2 ** 32 - 1
 
@@ -22,18 +22,20 @@ class FileStore
     end
   end
 
-  def initialize(root, index:, active_log:, sparse_factor: nil)
+  def initialize(root, index:, active_log:, sparse_factor: nil, dump_threshold: nil)
     @root = root
     @sparse_factor = sparse_factor || 4096
+    @dump_threshold = dump_threshold || @sparse_factor * 1024
     @index = index
     @write_sst = SortedSet.new
-    @read_sst = @write_sst
+    @write_sst_size = 0
+    @dumping_ssts = Set.new
     @mutex = Mutex.new
     @active_log = active_log
-    @inactive_log = nil
+    @jobs = Set.new
   end
 
-  def self.open(root, sparse_factor: nil)
+  def self.open(root, sparse_factor: nil, dump_threshold: nil)
     index_path = File.join(root, 'index.json')
     if Dir.exist?(root)
       index = JSON.parse(File.read(index_path))
@@ -46,7 +48,11 @@ class FileStore
     begin
       old_logs = Dir.glob(File.join(root, 'unwritten', '*'))
       active_log = File.open(File.join(root, 'unwritten', nano_s), 'w')
-      store = FileStore.new(root, index: index, active_log: active_log, sparse_factor: sparse_factor)
+      store = FileStore.new(root,
+                            index: index,
+                            active_log: active_log,
+                            sparse_factor: sparse_factor,
+                            dump_threshold: dump_threshold)
       begin
         old_logs.sort.each do |log|
           File.open(log) do |f|
@@ -59,7 +65,6 @@ class FileStore
         yield store
       ensure
         store.active_log.close
-        store.inactive_log&.close unless store.inactive_log&.closed?
       end
     ensure
       File.write(index_path, JSON.dump(index))
@@ -90,38 +95,43 @@ class FileStore
     sst_path(nano_s)
   end
 
-  def dump_sst!
-    sst = @mutex.synchronize do
-      s = @write_sst
-      @write_sst = SortedSet.new
-      @active_log.close
-      @inactive_log = @active_log
-      @active_log = File.open(File.join(@root, 'unwritten', nano_s), 'w')
-      s
-    end
+  def dump_sst!(sst, log)
     if sst.any?
+      # FIXME: atomic write
       f_name = new_sst_path
-      @index[File.basename(f_name)] = {}
       File.open(f_name, 'w') do |f|
         write_records(sst, f)
       end
-      File.delete(@inactive_log.path)
     end
-    @read_sst = @write_sst
+    File.delete(log.path)
+    @dumping_ssts.delete(sst)
   end
 
   def write_records(records, f)
-    file_index = @index[File.basename(f.path)]
+    file_index = {}
     last_index_offset = -@sparse_factor
     offset = 0
     records.each do |record|
       if offset >= last_index_offset + @sparse_factor
-        @mutex.synchronize do
-          file_index[record.key] = offset
-        end
+        file_index[record.key] = offset
         last_index_offset = offset
       end
       offset += write_kv(f, record.key, record.value)
+    end
+    @index[File.basename(f.path)] = file_index
+  end
+
+  def initiate_dump!
+    @write_sst_size = 0
+    s = @write_sst
+    @write_sst = SortedSet.new
+    @dumping_ssts.add(s)
+    @active_log.close
+    sst_log = @active_log
+    @active_log = File.open(File.join(@root, 'unwritten', nano_s), 'w')
+    @jobs << Thread.new(s, sst_log) do |sst, log|
+      dump_sst!(sst, log)
+      @mutex.synchronize { @jobs.delete(Thread.current) }
     end
   end
 
@@ -131,16 +141,30 @@ class FileStore
     end
     r = Record.new(key, value)
     @mutex.synchronize do
-      write_kv(@active_log, key, value)
+      @write_sst_size += write_kv(@active_log, key, value)
       if @write_sst.include?(r)
         @write_sst.delete(r)
       end
       @write_sst.add(r)
+      if @write_sst_size >= @dump_threshold
+        initiate_dump!
+      end
     end
   end
 
   def get(key)
-    record = @read_sst.find { |r| r.key == key }
+    record = @write_sst.find { |r| r.key == key }
+    unless record
+      @dumping_ssts.reverse_each do |sst|
+        sst.each do |r|
+          if r.key == key
+            record = r
+            break
+          end
+          break if record
+        end
+      end
+    end
     if record
       record.value
     else
@@ -182,6 +206,15 @@ class FileStore
         end
       end
       nil
+    end
+  end
+
+  def wait!
+    while @jobs.any?
+      thread = @mutex.synchronize do
+        @jobs.first
+      end
+      thread.join
     end
   end
 
@@ -241,7 +274,6 @@ class FileStore
         end
       end
     end
-    @index[File.basename(new.path)] = {}
     write_records(to_write, new)
   end
 
