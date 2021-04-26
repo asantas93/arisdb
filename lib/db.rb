@@ -2,13 +2,15 @@ require 'json'
 require 'set'
 require 'zlib'
 
+require_relative 'compressed_file'
+
 def nano_s
   (Time.now.to_r * 10 ** 9).to_i.to_s
 end
 
 class FileStore
 
-  attr_accessor :active_log
+  attr_accessor :active_log, :log_deflate
 
   MAX_VALUE_SIZE = 2 ** 32 - 1
 
@@ -32,6 +34,7 @@ class FileStore
     @dumping_ssts = Set.new
     @mutex = Mutex.new
     @active_log = active_log
+    @log_deflate = Zlib::Deflate.new
     @jobs = Set.new
   end
 
@@ -55,7 +58,7 @@ class FileStore
                             dump_threshold: dump_threshold)
       begin
         old_logs.sort.each do |log|
-          File.open(log) do |f|
+          CompressedFile.open(log) do |f|
             while (k, v = store.read_kv(f))
               store.put(k, v)
             end
@@ -64,6 +67,8 @@ class FileStore
         end
         yield store
       ensure
+        store.active_log.write(store.log_deflate.finish)
+        store.log_deflate.close
         store.active_log.close
       end
     ensure
@@ -75,16 +80,14 @@ class FileStore
 
   def decode_int(s) s.unpack('N').first end
 
-  def write_kv(f, key, value)
-    ksize = key.bytesize
-    # TODO: compress entire file, using Zlib::FULL_FLUSH at index points
-    v_deflated = Zlib.deflate(value)
-    vsize = v_deflated.bytesize
-    bytes_written = 0
-    bytes_written += f.write(encode_int(ksize))
-    bytes_written += f.write(key)
-    bytes_written += f.write(encode_int(vsize))
-    bytes_written + f.write(v_deflated)
+  def write_kv(f, key, value, deflater)
+    data = encode_int(key.bytesize) << key << encode_int(value.bytesize) << value
+    deflated = deflater.deflate(data)
+    if deflated.empty?
+      0
+    else
+      f.write(deflated)
+    end
   end
 
   def sst_path(name)
@@ -111,12 +114,19 @@ class FileStore
     file_index = {}
     last_index_offset = -@sparse_factor
     offset = 0
-    records.each do |record|
-      if offset >= last_index_offset + @sparse_factor
-        file_index[record.key] = offset
-        last_index_offset = offset
+    deflater = Zlib::Deflate.new
+    begin
+      records.each do |record|
+        if offset >= last_index_offset + @sparse_factor
+          offset += f.write(deflater.flush(Zlib::FULL_FLUSH)) unless offset == 0 # TODO: cleanup
+          file_index[record.key] = offset
+          last_index_offset = offset
+        end
+        offset += write_kv(f, record.key, record.value, deflater)
       end
-      offset += write_kv(f, record.key, record.value)
+    ensure
+      f.write(deflater.finish)
+      deflater.close
     end
     @index[File.basename(f.path)] = file_index
   end
@@ -126,7 +136,10 @@ class FileStore
     s = @write_sst
     @write_sst = SortedSet.new
     @dumping_ssts.add(s)
+    @active_log.write(@log_deflate.finish)
+    @log_deflate.close
     @active_log.close
+    @log_deflate = Zlib::Deflate.new
     sst_log = @active_log
     @active_log = File.open(File.join(@root, 'unwritten', nano_s), 'w')
     @jobs << Thread.new(s, sst_log) do |sst, log|
@@ -141,7 +154,7 @@ class FileStore
     end
     r = Record.new(key, value)
     @mutex.synchronize do
-      @write_sst_size += write_kv(@active_log, key, value)
+      @write_sst_size += write_kv(@active_log, key, value, @log_deflate)
       if @write_sst.include?(r)
         @write_sst.delete(r)
       end
@@ -183,13 +196,13 @@ class FileStore
       ranges.reverse_each do |fname, range|
         lower, upper = range
         start = lower[1]
-        data = File.open(sst_path(fname)) do |f|
+        data = CompressedFile.open(sst_path(fname)) do |f|
           f.seek(start)
           if upper.nil?
-            f.read
+            f.read_inflated
           else
             finish = upper[1]
-            f.read(finish - start)
+            f.read_inflated(finish - start)
           end
         end
         offset = 0
@@ -199,7 +212,7 @@ class FileStore
           value_size = decode_int(data.byteslice(offset...offset += 4))
           value = data.byteslice(offset...offset += value_size)
           if k == key
-            return Zlib.inflate(value)
+            return value
           elsif k > key
             break
           end
@@ -232,7 +245,7 @@ class FileStore
   def merge_ssts!(unopened, new, opened: [])
     if unopened.any?
       to_open = unopened.pop
-      File.open(to_open) do |f|
+      CompressedFile.open(to_open) do |f|
         opened << f
         merge_ssts!(unopened, new, opened: opened)
         @mutex.synchronize { @index.delete(File.basename(f.path)) }
@@ -278,14 +291,14 @@ class FileStore
   end
 
   def read_kv(f)
-    key_size_bytes = f.read(4)
-    if key_size_bytes.nil?
+    key_size_bytes = f.read_inflated(4)
+    if key_size_bytes.nil? || key_size_bytes.empty?
       nil
     else
       key_size = decode_int(key_size_bytes)
-      key = f.read(key_size)
-      value_size = decode_int(f.read(4))
-      value = Zlib.inflate(f.read(value_size))
+      key = f.read_inflated(key_size)
+      value_size = decode_int(f.read_inflated(4))
+      value = f.read_inflated(value_size)
       [key, value]
     end
   end
